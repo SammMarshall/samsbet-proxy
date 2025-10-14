@@ -1,13 +1,18 @@
+# samsbet_proxy/main.py
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import requests
 import logging
+import os
+import urllib3
 
-# Configuração básica de logging
+# Desativa os avisos de segurança sobre não verificar SSL
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
-# Headers aprimorados para o "disfarce"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -20,8 +25,17 @@ HEADERS = {
 async def proxy_request(path: str):
     sofascore_url = f"https://www.sofascore.com/api/v1/{path}"
     logging.info(f"Recebido pedido para: {sofascore_url}")
+    
+    proxy_url = os.environ.get("PROXY_URL")
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    
+    logging.info(f"Usando proxy: {'Sim' if proxies else 'Não'}")
+
     try:
-        response = requests.get(sofascore_url, headers=HEADERS)
+        # <<< A BALA DE PRATA ESTÁ AQUI: verify=False >>>
+        # Isso diz ao 'requests' para não se preocupar com a verificação SSL,
+        # exatamente como a flag -k no curl.
+        response = requests.get(sofascore_url, headers=HEADERS, proxies=proxies, verify=False)
         response.raise_for_status()
         return JSONResponse(content=response.json())
     except requests.exceptions.HTTPError as e:
