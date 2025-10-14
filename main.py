@@ -1,8 +1,8 @@
 # samsbet_proxy/main.py
 
-from fastapi import FastAPI, Request # <<< 1. Importar 'Request'
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import httpx
+import requests  # <-- Voltamos para o bom e velho 'requests'
 import logging
 import os
 import urllib3
@@ -21,13 +21,10 @@ HEADERS = {
     "Origin": "https://www.sofascore.com",
 }
 
-# Criamos um cliente assíncrono que será reutilizado
-client = httpx.AsyncClient(verify=False)
-
 @app.get("/{path:path}")
-async def proxy_request(path: str, request: Request): # <<< 2. Adicionar o parâmetro 'request'
+def proxy_request(path: str, request: Request): # <-- Removemos o 'async'
     
-    # <<< 3. Montar a URL completa, incluindo os parâmetros de consulta >>>
+    # Mantemos a lógica correta para montar a URL completa
     query_params = str(request.url.query)
     sofascore_url = f"https://www.sofascore.com/api/v1/{path}"
     if query_params:
@@ -36,12 +33,19 @@ async def proxy_request(path: str, request: Request): # <<< 2. Adicionar o parâ
     logging.info(f"Recebido pedido para: {sofascore_url}")
     
     proxy_url = os.environ.get("PROXY_URL")
-    proxies = {"http://": proxy_url, "https://": proxy_url} if proxy_url else None
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     
     logging.info(f"Usando proxy: {'Sim' if proxies else 'Não'}")
 
     try:
-        response = await client.get(sofascore_url, headers=HEADERS, proxies=proxies, timeout=20.0)
+        # Voltamos para a chamada síncrona e confiável do 'requests'
+        response = requests.get(
+            sofascore_url, 
+            headers=HEADERS, 
+            proxies=proxies, 
+            verify=False, 
+            timeout=20.0
+        )
         response.raise_for_status()
         return JSONResponse(content=response.json())
     except Exception as e:
