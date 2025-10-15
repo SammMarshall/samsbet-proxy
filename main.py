@@ -2,12 +2,12 @@
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import requests  # <-- Voltamos para o bom e velho 'requests'
+import requests
 import logging
 import os
 import urllib3
-import redis  # <-- Importa o redis
-import json   # <-- Importa o json para serialização
+import redis
+import json
 
 # --- Configurações ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -34,7 +34,7 @@ except Exception as e:
     logging.warning(f"⚠️ Falha ao conectar ao Redis: {e}")
     redis_client = None
 
-# --- Lógica do Proxy com Cache ---
+# --- Lógica do Proxy com Cache Condicional ---
 @app.get("/{path:path}")
 def proxy_request(path: str, request: Request):
     query_params = str(request.url.query)
@@ -42,16 +42,23 @@ def proxy_request(path: str, request: Request):
     if query_params:
         sofascore_url += f"?{query_params}"
 
-    # <<< LÓGICA DE CACHE >>>
-    cache_key = sofascore_url # A própria URL é a chave perfeita
-    if redis_client:
+    # <<< MUDANÇA CRUCIAL AQUI: A Regra de Negócio >>>
+    # Decidimos se devemos usar o cache para esta requisição específica.
+    # Se a URL contém 'scheduled-events', não usamos o cache.
+    should_use_cache = "scheduled-events" not in sofascore_url
+
+    # ETAPA 1: Tenta buscar no cache SOMENTE se a regra permitir
+    if should_use_cache and redis_client:
+        cache_key = sofascore_url
         cached_data = redis_client.get(cache_key)
         if cached_data:
             logging.info(f"✅ CACHE HIT para: {cache_key}")
             return JSONResponse(content=json.loads(cached_data))
+        logging.info(f"❌ CACHE MISS para: {cache_key}. Buscando na API...")
+    else:
+        logging.info(f"🚫 CACHE BYPASS para: {sofascore_url}")
 
-    logging.info(f"❌ CACHE MISS para: {cache_key}. Buscando na API...")
-    
+    # ETAPA 2: Se chegamos aqui, precisamos buscar na API (seja por CACHE MISS ou BYPASS)
     proxy_url = os.environ.get("PROXY_URL")
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     
@@ -60,10 +67,11 @@ def proxy_request(path: str, request: Request):
         response.raise_for_status()
         response_data = response.json()
 
-        # <<< SALVANDO NO CACHE >>>
-        if redis_client:
-            # Salva a resposta no Redis por 4 horas (14400 segundos)
-            redis_client.setex(cache_key, 14400, json.dumps(response_data))
+        # ETAPA 3: Salva no cache SOMENTE se a regra permitir
+        if should_use_cache and redis_client:
+            logging.info(f"💾 SALVANDO no cache: {sofascore_url}")
+            # Usamos a URL como chave e salvamos por 4 horas
+            redis_client.setex(sofascore_url, 14400, json.dumps(response_data))
 
         return JSONResponse(content=response_data)
     except Exception as e:
