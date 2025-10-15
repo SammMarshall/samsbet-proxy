@@ -6,10 +6,11 @@ import requests  # <-- Voltamos para o bom e velho 'requests'
 import logging
 import os
 import urllib3
+import redis  # <-- Importa o redis
+import json   # <-- Importa o json para serialização
 
-# Desativa os avisos de segurança
+# --- Configurações ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
@@ -21,33 +22,50 @@ HEADERS = {
     "Origin": "https://www.sofascore.com",
 }
 
+# --- Conexão com o Redis ---
+redis_client = None
+try:
+    redis_url = os.environ.get("REDIS_URL")
+    if redis_url:
+        redis_client = redis.from_url(redis_url)
+        redis_client.ping()
+        logging.info("✅ Conectado ao cache Redis com sucesso!")
+except Exception as e:
+    logging.warning(f"⚠️ Falha ao conectar ao Redis: {e}")
+    redis_client = None
+
+# --- Lógica do Proxy com Cache ---
 @app.get("/{path:path}")
-def proxy_request(path: str, request: Request): # <-- Removemos o 'async'
-    
-    # Mantemos a lógica correta para montar a URL completa
+def proxy_request(path: str, request: Request):
     query_params = str(request.url.query)
     sofascore_url = f"https://www.sofascore.com/api/v1/{path}"
     if query_params:
         sofascore_url += f"?{query_params}"
-    
-    logging.info(f"Recebido pedido para: {sofascore_url}")
+
+    # <<< LÓGICA DE CACHE >>>
+    cache_key = sofascore_url # A própria URL é a chave perfeita
+    if redis_client:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            logging.info(f"✅ CACHE HIT para: {cache_key}")
+            return JSONResponse(content=json.loads(cached_data))
+
+    logging.info(f"❌ CACHE MISS para: {cache_key}. Buscando na API...")
     
     proxy_url = os.environ.get("PROXY_URL")
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     
-    logging.info(f"Usando proxy: {'Sim' if proxies else 'Não'}")
-
     try:
-        # Voltamos para a chamada síncrona e confiável do 'requests'
-        response = requests.get(
-            sofascore_url, 
-            headers=HEADERS, 
-            proxies=proxies, 
-            verify=False, 
-            timeout=20.0
-        )
+        response = requests.get(sofascore_url, headers=HEADERS, proxies=proxies, verify=False, timeout=20.0)
         response.raise_for_status()
-        return JSONResponse(content=response.json())
+        response_data = response.json()
+
+        # <<< SALVANDO NO CACHE >>>
+        if redis_client:
+            # Salva a resposta no Redis por 4 horas (14400 segundos)
+            redis_client.setex(cache_key, 14400, json.dumps(response_data))
+
+        return JSONResponse(content=response_data)
     except Exception as e:
         logging.error(f"Erro no proxy para {sofascore_url}: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=500)
