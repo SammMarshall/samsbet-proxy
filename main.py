@@ -60,6 +60,7 @@ def proxy_request(path: str, request: Request):
 
     # ETAPA 2: Se chegamos aqui, precisamos buscar na API (seja por CACHE MISS ou BYPASS)
     proxy_url = os.environ.get("PROXY_URL")
+    logging.info(f"URL_PROXY: {proxy_url}")
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     
     try:
