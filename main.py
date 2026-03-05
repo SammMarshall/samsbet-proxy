@@ -370,7 +370,7 @@ def proxy_status(authorization: str = Header(default=None)):
         return JSONResponse({"ok": False, "proxy_url": "", "detail": "Nenhum proxy configurado."})
     try:
         test = requests.get(
-            "https://www.sofascore.com/api/v1/sport/football/scheduled-events/today",
+            "https://www.sofascore.com/api/v1/country/alpha2",
             headers=HEADERS,
             proxies={"http": url, "https": url},
             verify=False,
