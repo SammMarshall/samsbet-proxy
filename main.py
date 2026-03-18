@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 import requests
 import logging
 import os
+import time
 import urllib3
 from pydantic import BaseModel
 
@@ -20,13 +21,15 @@ HEADERS = {
     "Origin": "https://www.sofascore.com",
 }
 
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_GIST_ID = os.environ.get("GITHUB_GIST_ID", "")
 GIST_FILENAME  = "proxy_config.json"
 
+MAX_RETRIES        = 8    # tentativas em caso de bad_endpoint
+RETRY_SLEEP        = 0.5  # segundos entre tentativas
+
 # --- Gist helpers ---
 def gist_read() -> str:
-    """Lê a proxy_url do Gist. Retorna string vazia se falhar."""
     if not GITHUB_TOKEN or not GITHUB_GIST_ID:
         logging.warning("⚠️  GITHUB_TOKEN ou GITHUB_GIST_ID não configurados.")
         return ""
@@ -37,15 +40,14 @@ def gist_read() -> str:
             timeout=10,
         )
         res.raise_for_status()
-        content = res.json()["files"][GIST_FILENAME]["content"]
         import json
+        content = res.json()["files"][GIST_FILENAME]["content"]
         return json.loads(content).get("proxy_url", "")
     except Exception as e:
         logging.error(f"❌ Erro ao ler Gist: {e}")
         return ""
 
 def gist_write(proxy_url: str) -> bool:
-    """Grava a proxy_url no Gist. Retorna True se OK."""
     if not GITHUB_TOKEN or not GITHUB_GIST_ID:
         return False
     try:
@@ -76,6 +78,35 @@ def verify_token(authorization: str = Header(default=None)):
     if authorization != f"Bearer {admin_token}":
         raise HTTPException(status_code=401, detail="Token inválido.")
 
+# --- Requisição com retry para bad_endpoint ---
+def fetch_with_retry(sofascore_url: str, proxies: dict) -> requests.Response:
+    """
+    Tenta a requisição até MAX_RETRIES vezes.
+    Repete apenas se o Brightdata retornar bad_endpoint (erro 402/500).
+    Qualquer outro erro encerra imediatamente.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        response = requests.get(sofascore_url, headers=HEADERS, proxies=proxies, verify=False, timeout=20.0)
+        response_text = response.text.lower()
+
+        is_bad_endpoint = (
+            response.status_code in (402, 500)
+            and ("bad_endpoint" in response_text or "residential failed" in response_text)
+        )
+
+        if is_bad_endpoint:
+            logging.warning(f"⚠️ bad_endpoint tentativa {attempt}/{MAX_RETRIES}: {sofascore_url}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_SLEEP)
+            continue
+
+        # Qualquer outro caso (sucesso ou erro diferente) — retorna imediatamente
+        return response
+
+    # Esgotou todas as tentativas — retorna a última resposta para o caller tratar
+    logging.error(f"❌ Esgotou {MAX_RETRIES} tentativas (bad_endpoint) para {sofascore_url}")
+    return response
+
 # --- Dashboard HTML ---
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard():
@@ -91,8 +122,7 @@ def admin_dashboard():
     :root {
       --bg: #0a0a0f; --panel: #111118; --border: #1e1e2e;
       --accent: #00ff88; --accent-dim: #00ff8833; --accent-glow: #00ff8866;
-      --danger: #ff4466; --danger-dim: #ff446622;
-      --text: #e2e2f0; --muted: #6b6b8a;
+      --danger: #ff4466; --text: #e2e2f0; --muted: #6b6b8a;
       --mono: 'JetBrains Mono', monospace; --sans: 'Syne', sans-serif;
     }
     body {
@@ -120,7 +150,7 @@ def admin_dashboard():
     .status-badge { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 14px; font-weight: 600; }
     .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
     .dot.ok   { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); animation: pulse-ok 2s infinite; }
-    .dot.fail { background: var(--danger); box-shadow: 0 0 8px var(--danger);      animation: pulse-fail 1.5s infinite; }
+    .dot.fail { background: var(--danger); box-shadow: 0 0 8px var(--danger); animation: pulse-fail 1.5s infinite; }
     @keyframes pulse-ok   { 0%,100%{opacity:1} 50%{opacity:.4} }
     @keyframes pulse-fail { 0%,100%{opacity:1} 50%{opacity:.3} }
     .status-label { color: var(--text); }
@@ -130,10 +160,7 @@ def admin_dashboard():
       font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all;
       background: #0a0a0f; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; min-height: 38px;
     }
-    .gist-badge {
-      display: flex; align-items: center; gap: 6px;
-      font-family: var(--mono); font-size: 11px; color: var(--muted);
-    }
+    .gist-badge { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
     .gist-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
     .gist-dot.ok   { background: var(--accent); }
     .gist-dot.fail { background: var(--danger); }
@@ -176,12 +203,8 @@ def admin_dashboard():
 </head>
 <body>
 <div class="container">
-  <header>
-    <h1>Proxy Manager</h1>
-    <span>samsbet</span>
-  </header>
+  <header><h1>Proxy Manager</h1><span>samsbet</span></header>
 
-  <!-- Auth -->
   <div class="card" id="auth-card">
     <span class="card-title">Autenticação</span>
     <div>
@@ -193,7 +216,6 @@ def admin_dashboard():
     </button>
   </div>
 
-  <!-- Status -->
   <div class="card" id="main-card" style="display:none">
     <span class="card-title">Status do Proxy</span>
     <div class="status-row">
@@ -213,7 +235,6 @@ def admin_dashboard():
     </div>
   </div>
 
-  <!-- Update -->
   <div class="card" id="update-card" style="display:none">
     <span class="card-title">Atualizar Proxy URL</span>
     <div>
@@ -226,46 +247,35 @@ def admin_dashboard():
         <div class="spinner" style="border-top-color:var(--muted)"></div>
       </button>
       <button class="btn btn-primary" onclick="updateProxy(event)">
-        <span class="btn-text">Salvar &amp; Testar</span>
-        <div class="spinner"></div>
+        <span class="btn-text">Salvar &amp; Testar</span><div class="spinner"></div>
       </button>
     </div>
   </div>
 </div>
-
 <div id="toast"></div>
 <script>
   let TOKEN = sessionStorage.getItem('admin_token') || '';
 
-  function toast(msg, type = 'ok') {
+  function toast(msg, type='ok') {
     const el = document.getElementById('toast');
-    el.textContent = msg;
-    el.className = 'show ' + type;
-    clearTimeout(el._t);
-    el._t = setTimeout(() => el.className = '', 3500);
+    el.textContent = msg; el.className = 'show ' + type;
+    clearTimeout(el._t); el._t = setTimeout(() => el.className = '', 3500);
   }
-
-  function setLoading(btn, yes) {
-    btn.classList.toggle('loading', yes);
-    btn.disabled = yes;
-  }
+  function setLoading(btn, yes) { btn.classList.toggle('loading', yes); btn.disabled = yes; }
 
   function renderStatus(data) {
-    const dot   = document.getElementById('status-dot');
-    const label = document.getElementById('status-label');
-    const disp  = document.getElementById('proxy-display');
-    const gDot  = document.getElementById('gist-dot');
-    const gLbl  = document.getElementById('gist-label');
-    dot.className   = 'dot ' + (data.ok ? 'ok' : 'fail');
-    label.className = 'status-label ' + (data.ok ? 'ok' : 'fail');
-    label.textContent = data.ok ? 'Funcionando' : 'Com falha';
-    disp.textContent  = data.proxy_url || '(sem proxy configurado)';
-    if (data.gist_synced !== undefined) {
-      gDot.className = 'gist-dot ' + (data.gist_synced ? 'ok' : 'fail');
+    const dot  = document.getElementById('status-dot');
+    const lbl  = document.getElementById('status-label');
+    const disp = document.getElementById('proxy-display');
+    const gDot = document.getElementById('gist-dot');
+    const gLbl = document.getElementById('gist-label');
+    dot.className  = 'dot ' + (data.ok ? 'ok' : 'fail');
+    lbl.className  = 'status-label ' + (data.ok ? 'ok' : 'fail');
+    lbl.textContent  = data.ok ? 'Funcionando' : 'Com falha';
+    disp.textContent = data.proxy_url || '(sem proxy configurado)';
+    if (data.gist_synced !== undefined && data.gist_synced !== null) {
+      gDot.className   = 'gist-dot ' + (data.gist_synced ? 'ok' : 'fail');
       gLbl.textContent = data.gist_synced ? 'Gist: sincronizado ✓' : 'Gist: falha ao sincronizar';
-    } else {
-      gDot.className = 'gist-dot';
-      gLbl.textContent = 'Gist: —';
     }
   }
 
@@ -284,19 +294,16 @@ def admin_dashboard():
     try {
       const res = await fetch('/proxy-status', { headers: { Authorization: 'Bearer ' + val } });
       if (res.status === 401) { toast('Token inválido ✗', 'fail'); return; }
-      TOKEN = val;
-      sessionStorage.setItem('admin_token', TOKEN);
+      TOKEN = val; sessionStorage.setItem('admin_token', TOKEN);
       showApp(await res.json());
     } catch(e) { toast('Erro de conexão', 'fail'); }
     finally { setLoading(btn, false); }
   }
 
   async function checkStatus(e) {
-    const btn = e.currentTarget;
-    setLoading(btn, true);
+    const btn = e.currentTarget; setLoading(btn, true);
     try {
-      const res  = await fetch('/proxy-status', { headers: { Authorization: 'Bearer ' + TOKEN } });
-      const data = await res.json();
+      const data = await fetch('/proxy-status', { headers: { Authorization: 'Bearer ' + TOKEN } }).then(r => r.json());
       renderStatus(data);
       toast(data.ok ? '✓ Proxy OK' : '✗ Proxy com falha', data.ok ? 'ok' : 'fail');
     } catch(e) { toast('Erro ao verificar', 'fail'); }
@@ -309,15 +316,14 @@ def admin_dashboard():
     if (!url) { toast('Cole a URL do proxy', 'fail'); return; }
     setLoading(btn, true);
     try {
-      const res  = await fetch('/proxy-update', {
+      const data = await fetch('/proxy-update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
         body: JSON.stringify({ proxy_url: url })
-      });
-      const data = await res.json();
+      }).then(r => r.json());
       renderStatus(data);
       document.getElementById('proxy-input').value = '';
-      if (data.ok && data.gist_synced)      toast('✓ Proxy atualizado e salvo no Gist!', 'ok');
+      if (data.ok && data.gist_synced)       toast('✓ Proxy atualizado e salvo no Gist!', 'ok');
       else if (data.ok && !data.gist_synced) toast('✓ Proxy OK, mas falhou ao salvar no Gist', 'fail');
       else                                   toast('✗ Proxy salvo, mas falhou no teste', 'fail');
     } catch(e) { toast('Erro ao atualizar', 'fail'); }
@@ -325,17 +331,14 @@ def admin_dashboard():
   }
 
   async function clearProxy(e) {
-    const btn = e.currentTarget;
-    setLoading(btn, true);
+    const btn = e.currentTarget; setLoading(btn, true);
     try {
-      const res  = await fetch('/proxy-update', {
+      const data = await fetch('/proxy-update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
         body: JSON.stringify({ proxy_url: '' })
-      });
-      const data = await res.json();
-      renderStatus(data);
-      toast('Proxy removido', 'ok');
+      }).then(r => r.json());
+      renderStatus(data); toast('Proxy removido', 'ok');
     } catch(e) { toast('Erro', 'fail'); }
     finally { setLoading(btn, false); }
   }
@@ -343,14 +346,10 @@ def admin_dashboard():
   document.getElementById('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
   document.getElementById('proxy-input').addEventListener('keydown', e => { if (e.key === 'Enter') updateProxy(e); });
 
-  // Auto-login se token salvo
   if (TOKEN) {
     fetch('/proxy-status', { headers: { Authorization: 'Bearer ' + TOKEN } })
       .then(r => r.ok ? r.json() : null)
-      .then(data => {
-        if (!data) { sessionStorage.removeItem('admin_token'); TOKEN = ''; return; }
-        showApp(data);
-      });
+      .then(data => { if (!data) { sessionStorage.removeItem('admin_token'); TOKEN = ''; return; } showApp(data); });
   }
 </script>
 </body>
@@ -370,7 +369,7 @@ def proxy_status(authorization: str = Header(default=None)):
         return JSONResponse({"ok": False, "proxy_url": "", "detail": "Nenhum proxy configurado."})
     try:
         test = requests.get(
-            "https://www.sofascore.com/api/v1/country/alpha2",
+            "https://www.sofascore.com/api/v1/sport/football/scheduled-events/today",
             headers=HEADERS,
             proxies={"http": url, "https": url},
             verify=False,
@@ -387,14 +386,9 @@ def proxy_update(body: ProxyUpdateRequest, authorization: str = Header(default=N
     verify_token(authorization)
     proxy_state["url"] = body.proxy_url
     logging.info(f"🔄 PROXY_URL atualizado para: {body.proxy_url or '(vazio)'}")
-
-    # Grava no Gist imediatamente
     gist_ok = gist_write(body.proxy_url)
-
     if not body.proxy_url:
         return JSONResponse({"ok": False, "proxy_url": "", "gist_synced": gist_ok, "detail": "Proxy removido."})
-
-    # Testa o novo proxy
     try:
         test = requests.get(
             "https://www.sofascore.com/api/v1/sport/football/scheduled-events/today",
@@ -422,7 +416,7 @@ def proxy_request(path: str, request: Request):
     proxies = {"http": url, "https": url} if url else None
 
     try:
-        response = requests.get(sofascore_url, headers=HEADERS, proxies=proxies, verify=False, timeout=20.0)
+        response = fetch_with_retry(sofascore_url, proxies)
         response.raise_for_status()
         return JSONResponse(content=response.json())
     except Exception as e:
