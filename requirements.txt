@@ -4,3 +4,4 @@ requests
 httpx
 redis
 scrapling
+curl_cffi
