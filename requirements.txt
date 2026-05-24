@@ -5,4 +5,5 @@ httpx
 redis
 scrapling
 curl_cffi
+browserforge
 python-dotenv
