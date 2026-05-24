@@ -5,3 +5,4 @@ httpx
 redis
 scrapling
 curl_cffi
+python-dotenv
