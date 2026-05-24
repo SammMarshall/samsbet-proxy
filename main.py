@@ -9,6 +9,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 import requests
 import urllib3
 from fastapi import FastAPI, Header, HTTPException, Request
