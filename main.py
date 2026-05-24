@@ -229,7 +229,8 @@ def fetch_with_scrapling(
         from scrapling.fetchers import Fetcher
     except Exception as e:
         raise RuntimeError(
-            "Scrapling não está instalado. Adicione 'scrapling[fetchers]' ao requirements.txt."
+            f"Erro ao importar Scrapling Fetcher: {type(e).__name__}: {e}. "
+            "Verifique se requirements.txt instalou scrapling, curl_cffi e browserforge."
         ) from e
 
     kwargs: dict[str, Any] = {
