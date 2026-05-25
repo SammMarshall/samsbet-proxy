@@ -92,6 +92,12 @@ def safe_proxy_label(proxy_url: Optional[str]) -> str:
         return "configured"
 
 
+def proxy_label_from_mapping(proxies: Optional[dict]) -> str:
+    if not proxies:
+        return "none"
+    return safe_proxy_label(proxies.get("https") or proxies.get("http"))
+
+
 def build_sofascore_url(path: str, query_params: str = "") -> str:
     clean_path = path.lstrip("/")
     url = f"{SOFASCORE_BASE_URL}/{clean_path}"
@@ -230,7 +236,7 @@ def fetch_with_scrapling(
     except Exception as e:
         raise RuntimeError(
             f"Erro ao importar Scrapling Fetcher: {type(e).__name__}: {e}. "
-            "Verifique se requirements.txt instalou scrapling, curl_cffi e browserforge."
+            "Verifique se requirements.txt instalou scrapling, curl_cffi, browserforge e playwright."
         ) from e
 
     kwargs: dict[str, Any] = {
@@ -279,7 +285,7 @@ def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedRes
             try:
                 scrapling_response = fetch_with_scrapling(sofascore_url, proxies=None)
                 logger.info(
-                    "auto scrapling status=%s elapsed_ms=%s url=%s",
+                    "auto scrapling status=%s elapsed_ms=%s proxy=none url=%s",
                     scrapling_response.status_code,
                     scrapling_response.elapsed_ms,
                     sofascore_url,
@@ -287,11 +293,16 @@ def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedRes
                 if scrapling_response.status_code < 400:
                     return scrapling_response
                 logger.warning(
-                    "auto scrapling falhou status=%s; tentando requests/proxy",
+                    "auto scrapling falhou status=%s; tentando requests/proxy=%s",
                     scrapling_response.status_code,
+                    proxy_label_from_mapping(proxies),
                 )
             except Exception as e:
-                logger.warning("auto scrapling exception; tentando requests/proxy: %s", e)
+                logger.warning(
+                    "auto scrapling exception; tentando requests/proxy=%s: %s",
+                    proxy_label_from_mapping(proxies),
+                    e,
+                )
         return fetch_with_requests(sofascore_url, proxies=proxies)
 
     return fetch_with_requests(sofascore_url, proxies=proxies)
@@ -308,6 +319,7 @@ def fetch_with_retry(sofascore_url: str, proxies: Optional[dict]) -> NormalizedR
     for attempt in range(1, MAX_RETRIES + 1):
         response = choose_fetcher(sofascore_url, proxies)
         last_response = response
+        proxy_used = proxy_label_from_mapping(proxies) if response.fetcher == "requests" else "none"
 
         logger.info(
             "upstream attempt=%s/%s fetcher=%s status=%s elapsed_ms=%s proxy=%s url=%s",
@@ -316,7 +328,7 @@ def fetch_with_retry(sofascore_url: str, proxies: Optional[dict]) -> NormalizedR
             response.fetcher,
             response.status_code,
             response.elapsed_ms,
-            safe_proxy_label(proxy_state.get("url")) if proxies else "none",
+            proxy_used,
             sofascore_url,
         )
 
@@ -565,6 +577,7 @@ def debug_fetchers(authorization: str = Header(default=None)):
                 "status_code": res.status_code,
                 "elapsed_ms": res.elapsed_ms,
                 "fetcher": res.fetcher,
+                "proxy": "none" if name.endswith("direct") else proxy_label_from_mapping(proxies),
                 "text_preview": (res.text or "")[:160],
             }
         except Exception as e:
