@@ -6,4 +6,5 @@ redis
 scrapling
 curl_cffi
 browserforge
+playwright
 python-dotenv
