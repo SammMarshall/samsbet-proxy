@@ -22,7 +22,6 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-# --- Configurações ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -52,33 +51,21 @@ RETRY_SLEEP = float(os.environ.get("RETRY_SLEEP", "0.5"))
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "20.0"))
 STATUS_TIMEOUT = float(os.environ.get("STATUS_TIMEOUT", "10.0"))
 
-# Mantém o comportamento atual como padrão.
-# Valores aceitos:
-# - requests: comportamento antigo, usando requests e proxy se configurado.
-# - scrapling: usa Scrapling Fetcher como motor principal.
-# - auto: tenta Scrapling direto primeiro; se falhar, cai para requests/proxy.
+HOME_RELAY_URL = os.environ.get("HOME_RELAY_URL", "").rstrip("/")
+HOME_RELAY_TOKEN = os.environ.get("HOME_RELAY_TOKEN", "")
+
 SOFASCORE_FETCHER = os.environ.get("SOFASCORE_FETCHER", "requests").strip().lower()
-if SOFASCORE_FETCHER not in {"requests", "scrapling", "auto"}:
+VALID_FETCHERS = {"requests", "scrapling", "home_relay", "auto"}
+if SOFASCORE_FETCHER not in VALID_FETCHERS:
     logger.warning("SOFASCORE_FETCHER inválido '%s'; usando 'requests'", SOFASCORE_FETCHER)
     SOFASCORE_FETCHER = "requests"
 
 SCRAPLING_IMPERSONATE = os.environ.get("SCRAPLING_IMPERSONATE", "chrome")
 SCRAPLING_HTTP3 = os.environ.get("SCRAPLING_HTTP3", "false").lower() in {"1", "true", "yes", "sim"}
-SCRAPLING_STEALTHY_HEADERS = os.environ.get("SCRAPLING_STEALTHY_HEADERS", "true").lower() in {
-    "1",
-    "true",
-    "yes",
-    "sim",
-}
-AUTO_TRY_SCRAPLING_BEFORE_PROXY = os.environ.get("AUTO_TRY_SCRAPLING_BEFORE_PROXY", "true").lower() in {
-    "1",
-    "true",
-    "yes",
-    "sim",
-}
+SCRAPLING_STEALTHY_HEADERS = os.environ.get("SCRAPLING_STEALTHY_HEADERS", "true").lower() in {"1", "true", "yes", "sim"}
+AUTO_TRY_SCRAPLING_BEFORE_PROXY = os.environ.get("AUTO_TRY_SCRAPLING_BEFORE_PROXY", "true").lower() in {"1", "true", "yes", "sim"}
 
 
-# --- Helpers gerais ---
 def safe_proxy_label(proxy_url: Optional[str]) -> str:
     if not proxy_url:
         return "none"
@@ -87,6 +74,19 @@ def safe_proxy_label(proxy_url: Optional[str]) -> str:
         host = parsed.hostname or "unknown-host"
         port = f":{parsed.port}" if parsed.port else ""
         scheme = parsed.scheme or "proxy"
+        return f"{scheme}://{host}{port}"
+    except Exception:
+        return "configured"
+
+
+def safe_endpoint_label(url: Optional[str]) -> str:
+    if not url:
+        return "none"
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "unknown-host"
+        port = f":{parsed.port}" if parsed.port else ""
+        scheme = parsed.scheme or "https"
         return f"{scheme}://{host}{port}"
     except Exception:
         return "configured"
@@ -104,6 +104,26 @@ def build_sofascore_url(path: str, query_params: str = "") -> str:
     if query_params:
         url += f"?{query_params}"
     return url
+
+
+def build_home_relay_url(sofascore_url: str) -> str:
+    if not HOME_RELAY_URL or not HOME_RELAY_TOKEN:
+        raise RuntimeError("HOME_RELAY_URL ou HOME_RELAY_TOKEN não configurado.")
+
+    upstream = urlparse(sofascore_url)
+    base = urlparse(SOFASCORE_BASE_URL)
+    base_path = base.path.rstrip("/")
+    upstream_path = upstream.path
+
+    if base_path and upstream_path.startswith(base_path + "/"):
+        relay_path = upstream_path[len(base_path):].lstrip("/")
+    else:
+        relay_path = upstream_path.lstrip("/")
+
+    relay_url = f"{HOME_RELAY_URL}/{relay_path}"
+    if upstream.query:
+        relay_url += f"?{upstream.query}"
+    return relay_url
 
 
 @dataclass
@@ -126,6 +146,10 @@ class NormalizedResponse:
             )
 
 
+def _json_from_text(text: str) -> Any:
+    return json.loads(text)
+
+
 def _response_text_from_scrapling(page: Any) -> str:
     text_attr = getattr(page, "text", None)
     if callable(text_attr):
@@ -144,11 +168,6 @@ def _response_text_from_scrapling(page: Any) -> str:
     return str(body or "")
 
 
-def _json_from_text(text: str) -> Any:
-    return json.loads(text)
-
-
-# --- Gist helpers ---
 def gist_read() -> str:
     if not GITHUB_TOKEN or not GITHUB_GIST_ID:
         logger.warning("GITHUB_TOKEN ou GITHUB_GIST_ID não configurados.")
@@ -185,14 +204,13 @@ def gist_write(proxy_url: str) -> bool:
         return False
 
 
-# --- Estado em memória — carrega do Gist na inicialização ---
 _initial_url = gist_read() or os.environ.get("PROXY_URL", "")
 logger.info("Proxy inicial: %s", safe_proxy_label(_initial_url))
 logger.info("SOFASCORE_FETCHER=%s", SOFASCORE_FETCHER)
+logger.info("HOME_RELAY_URL=%s", safe_endpoint_label(HOME_RELAY_URL))
 proxy_state = {"url": _initial_url}
 
 
-# --- Auth helper ---
 def verify_token(authorization: str = Header(default=None)):
     admin_token = os.environ.get("ADMIN_TOKEN")
     if not admin_token:
@@ -201,7 +219,6 @@ def verify_token(authorization: str = Header(default=None)):
         raise HTTPException(status_code=401, detail="Token inválido.")
 
 
-# --- Motores de fetch ---
 def fetch_with_requests(sofascore_url: str, proxies: Optional[dict], timeout: float = REQUEST_TIMEOUT) -> NormalizedResponse:
     started = time.perf_counter()
     response = requests.get(
@@ -212,13 +229,20 @@ def fetch_with_requests(sofascore_url: str, proxies: Optional[dict], timeout: fl
         timeout=timeout,
     )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-    return NormalizedResponse(
-        status_code=response.status_code,
-        text=response.text,
-        json_loader=response.json,
-        fetcher="requests",
-        elapsed_ms=elapsed_ms,
+    return NormalizedResponse(response.status_code, response.text, response.json, "requests", elapsed_ms)
+
+
+def fetch_with_home_relay(sofascore_url: str, timeout: float = REQUEST_TIMEOUT) -> NormalizedResponse:
+    relay_url = build_home_relay_url(sofascore_url)
+    started = time.perf_counter()
+    header_name = "x-relay-" + "token"
+    response = requests.get(
+        relay_url,
+        headers={header_name: HOME_RELAY_TOKEN},
+        timeout=timeout,
     )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return NormalizedResponse(response.status_code, response.text, response.json, "home_relay", elapsed_ms)
 
 
 def fetch_with_scrapling(
@@ -226,11 +250,6 @@ def fetch_with_scrapling(
     proxies: Optional[dict] = None,
     timeout: float = REQUEST_TIMEOUT,
 ) -> NormalizedResponse:
-    """Fetch via Scrapling Fetcher.
-
-    Usa curl_cffi por baixo, com impersonação TLS e headers de navegador.
-    O proxy é aceito para testes/fallback, mas o objetivo principal aqui é testar sem proxy.
-    """
     try:
         from scrapling.fetchers import Fetcher
     except Exception as e:
@@ -258,13 +277,12 @@ def fetch_with_scrapling(
     status_code = getattr(page, "status", None) or getattr(page, "status_code", None) or 0
     text = _response_text_from_scrapling(page)
     json_func = getattr(page, "json", None)
-
     return NormalizedResponse(
-        status_code=int(status_code),
-        text=text,
-        json_loader=json_func if callable(json_func) else lambda: _json_from_text(text),
-        fetcher="scrapling",
-        elapsed_ms=elapsed_ms,
+        int(status_code),
+        text,
+        json_func if callable(json_func) else lambda: _json_from_text(text),
+        "scrapling",
+        elapsed_ms,
     )
 
 
@@ -276,7 +294,9 @@ def is_bad_endpoint(response: NormalizedResponse) -> bool:
 
 
 def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedResponse:
-    """Executa uma tentativa única conforme SOFASCORE_FETCHER."""
+    if SOFASCORE_FETCHER == "home_relay":
+        return fetch_with_home_relay(sofascore_url)
+
     if SOFASCORE_FETCHER == "scrapling":
         return fetch_with_scrapling(sofascore_url, proxies=None)
 
@@ -285,7 +305,7 @@ def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedRes
             try:
                 scrapling_response = fetch_with_scrapling(sofascore_url, proxies=None)
                 logger.info(
-                    "auto scrapling status=%s elapsed_ms=%s proxy=none url=%s",
+                    "auto scrapling status=%s elapsed_ms=%s route=direct url=%s",
                     scrapling_response.status_code,
                     scrapling_response.elapsed_ms,
                     sofascore_url,
@@ -308,27 +328,28 @@ def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedRes
     return fetch_with_requests(sofascore_url, proxies=proxies)
 
 
-# --- Requisição com retry para bad_endpoint ---
 def fetch_with_retry(sofascore_url: str, proxies: Optional[dict]) -> NormalizedResponse:
-    """
-    Mantém o retry antigo para bad_endpoint de proxy.
-    No modo default, continua usando requests exatamente como antes.
-    """
     last_response: Optional[NormalizedResponse] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         response = choose_fetcher(sofascore_url, proxies)
         last_response = response
-        proxy_used = proxy_label_from_mapping(proxies) if response.fetcher == "requests" else "none"
+
+        if response.fetcher == "requests":
+            route = proxy_label_from_mapping(proxies)
+        elif response.fetcher == "home_relay":
+            route = safe_endpoint_label(HOME_RELAY_URL)
+        else:
+            route = "direct"
 
         logger.info(
-            "upstream attempt=%s/%s fetcher=%s status=%s elapsed_ms=%s proxy=%s url=%s",
+            "upstream attempt=%s/%s fetcher=%s status=%s elapsed_ms=%s route=%s url=%s",
             attempt,
             MAX_RETRIES,
             response.fetcher,
             response.status_code,
             response.elapsed_ms,
-            proxy_used,
+            route,
             sofascore_url,
         )
 
@@ -346,7 +367,6 @@ def fetch_with_retry(sofascore_url: str, proxies: Optional[dict]) -> NormalizedR
     return last_response
 
 
-# --- Dashboard HTML ---
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard():
     html = """<!DOCTYPE html>
@@ -356,34 +376,17 @@ def admin_dashboard():
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Proxy Manager</title>
   <style>
-    body { font-family: Arial, sans-serif; background:#0a0a0f; color:#e2e2f0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
-    .container { width:100%; max-width:680px; display:flex; flex-direction:column; gap:16px; }
-    .card { background:#111118; border:1px solid #1e1e2e; border-radius:12px; padding:20px; display:flex; flex-direction:column; gap:12px; }
-    h1 { margin:0 0 4px; }
-    small, label { color:#8a8aa8; }
-    input { width:100%; background:#0a0a0f; color:#fff; border:1px solid #33334a; border-radius:8px; padding:11px; box-sizing:border-box; }
-    button { border:0; border-radius:8px; padding:11px 14px; font-weight:700; cursor:pointer; background:#00ff88; color:#000; }
-    button.secondary { background:transparent; color:#e2e2f0; border:1px solid #33334a; }
-    .row { display:flex; gap:10px; }
-    .row button { flex:1; }
-    pre { white-space:pre-wrap; word-break:break-word; background:#0a0a0f; padding:12px; border-radius:8px; border:1px solid #1e1e2e; }
-    .ok { color:#00ff88; }
-    .fail { color:#ff4466; }
+    body{font-family:Arial,sans-serif;background:#0a0a0f;color:#e2e2f0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}.container{width:100%;max-width:680px;display:flex;flex-direction:column;gap:16px}.card{background:#111118;border:1px solid #1e1e2e;border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:12px}input{width:100%;background:#0a0a0f;color:#fff;border:1px solid #33334a;border-radius:8px;padding:11px;box-sizing:border-box}button{border:0;border-radius:8px;padding:11px 14px;font-weight:700;cursor:pointer;background:#00ff88;color:#000}.secondary{background:transparent;color:#e2e2f0;border:1px solid #33334a}.row{display:flex;gap:10px}.row button{flex:1}pre{white-space:pre-wrap;word-break:break-word;background:#0a0a0f;padding:12px;border-radius:8px;border:1px solid #1e1e2e}.ok{color:#00ff88}.fail{color:#ff4466}
   </style>
 </head>
 <body>
 <div class="container">
-  <div>
-    <h1>Proxy Manager</h1>
-    <small>samsbet-proxy</small>
-  </div>
-
+  <div><h1>Proxy Manager</h1><small>samsbet-proxy</small></div>
   <div class="card" id="auth-card">
     <label>Admin Token</label>
     <input type="password" id="token-input" placeholder="Bearer token" />
     <button onclick="doLogin()">Entrar</button>
   </div>
-
   <div class="card" id="main-card" style="display:none">
     <strong>Status</strong>
     <div id="status-line">—</div>
@@ -393,76 +396,29 @@ def admin_dashboard():
       <button class="secondary" onclick="checkFetchers()">Diagnóstico fetchers</button>
     </div>
   </div>
-
   <div class="card" id="update-card" style="display:none">
     <label>Nova URL do proxy</label>
     <input type="text" id="proxy-input" placeholder="http://user:pass@host:port" />
-    <div class="row">
-      <button class="secondary" onclick="clearProxy()">Limpar</button>
-      <button onclick="updateProxy()">Salvar & Testar</button>
-    </div>
+    <div class="row"><button class="secondary" onclick="clearProxy()">Limpar</button><button onclick="updateProxy()">Salvar & Testar</button></div>
   </div>
 </div>
 <script>
-let TOKEN = sessionStorage.getItem('admin_token') || '';
-function authHeaders() { return { Authorization: 'Bearer ' + TOKEN }; }
-function render(data) {
-  document.getElementById('status-line').innerHTML = data.ok ? '<span class="ok">Funcionando</span>' : '<span class="fail">Com falha</span>';
-  document.getElementById('status-json').textContent = JSON.stringify(data, null, 2);
-}
-function showApp(data) {
-  document.getElementById('auth-card').style.display = 'none';
-  document.getElementById('main-card').style.display = 'flex';
-  document.getElementById('update-card').style.display = 'flex';
-  render(data);
-}
-async function doLogin() {
-  const val = document.getElementById('token-input').value.trim();
-  if (!val) return alert('Digite o token');
-  TOKEN = val;
-  const res = await fetch('/proxy-status', { headers: authHeaders() });
-  if (!res.ok) return alert('Token inválido ou erro');
-  sessionStorage.setItem('admin_token', TOKEN);
-  showApp(await res.json());
-}
-async function checkStatus() {
-  const data = await fetch('/proxy-status', { headers: authHeaders() }).then(r => r.json());
-  render(data);
-}
-async function checkFetchers() {
-  const data = await fetch('/debug/fetchers', { headers: authHeaders() }).then(r => r.json());
-  render({ ok: data.summary && data.summary.any_ok, ...data });
-}
-async function updateProxy() {
-  const url = document.getElementById('proxy-input').value.trim();
-  const data = await fetch('/proxy-update', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ proxy_url: url })
-  }).then(r => r.json());
-  document.getElementById('proxy-input').value = '';
-  render(data);
-}
-async function clearProxy() {
-  const data = await fetch('/proxy-update', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ proxy_url: '' })
-  }).then(r => r.json());
-  render(data);
-}
-if (TOKEN) {
-  fetch('/proxy-status', { headers: authHeaders() })
-    .then(r => r.ok ? r.json() : null)
-    .then(data => { if (data) showApp(data); else sessionStorage.removeItem('admin_token'); });
-}
+let TOKEN=sessionStorage.getItem('admin_token')||'';
+function authHeaders(){return{Authorization:'Bearer '+TOKEN}}
+function render(data){document.getElementById('status-line').innerHTML=data.ok?'<span class="ok">Funcionando</span>':'<span class="fail">Com falha</span>';document.getElementById('status-json').textContent=JSON.stringify(data,null,2)}
+function showApp(data){document.getElementById('auth-card').style.display='none';document.getElementById('main-card').style.display='flex';document.getElementById('update-card').style.display='flex';render(data)}
+async function doLogin(){const val=document.getElementById('token-input').value.trim();if(!val)return alert('Digite o token');TOKEN=val;const res=await fetch('/proxy-status',{headers:authHeaders()});if(!res.ok)return alert('Token inválido ou erro');sessionStorage.setItem('admin_token',TOKEN);showApp(await res.json())}
+async function checkStatus(){render(await fetch('/proxy-status',{headers:authHeaders()}).then(r=>r.json()))}
+async function checkFetchers(){const data=await fetch('/debug/fetchers',{headers:authHeaders()}).then(r=>r.json());render({ok:data.summary&&data.summary.any_ok,...data})}
+async function updateProxy(){const url=document.getElementById('proxy-input').value.trim();const data=await fetch('/proxy-update',{method:'POST',headers:{'Content-Type':'application/json',...authHeaders()},body:JSON.stringify({proxy_url:url})}).then(r=>r.json());document.getElementById('proxy-input').value='';render(data)}
+async function clearProxy(){const data=await fetch('/proxy-update',{method:'POST',headers:{'Content-Type':'application/json',...authHeaders()},body:JSON.stringify({proxy_url:''})}).then(r=>r.json());render(data)}
+if(TOKEN){fetch('/proxy-status',{headers:authHeaders()}).then(r=>r.ok?r.json():null).then(data=>{if(data)showApp(data);else sessionStorage.removeItem('admin_token')})}
 </script>
 </body>
 </html>"""
     return HTMLResponse(content=html)
 
 
-# --- Endpoints de gerenciamento ---
 class ProxyUpdateRequest(BaseModel):
     proxy_url: str
 
@@ -472,44 +428,14 @@ def proxy_status(authorization: str = Header(default=None)):
     verify_token(authorization)
     url = proxy_state["url"]
     if not url:
-        return JSONResponse(
-            {
-                "ok": False,
-                "proxy_url": "",
-                "fetcher_mode": SOFASCORE_FETCHER,
-                "detail": "Nenhum proxy configurado.",
-            }
-        )
+        return JSONResponse({"ok": False, "proxy_url": "", "fetcher_mode": SOFASCORE_FETCHER, "home_relay_url": safe_endpoint_label(HOME_RELAY_URL), "detail": "Nenhum proxy configurado."})
     try:
-        test = fetch_with_requests(
-            SOFASCORE_TEST_URL,
-            proxies={"http": url, "https": url},
-            timeout=STATUS_TIMEOUT,
-        )
+        test = fetch_with_requests(SOFASCORE_TEST_URL, proxies={"http": url, "https": url}, timeout=STATUS_TIMEOUT)
         test.raise_for_status()
-        return JSONResponse(
-            {
-                "ok": True,
-                "proxy_url": url,
-                "proxy_label": safe_proxy_label(url),
-                "fetcher": test.fetcher,
-                "fetcher_mode": SOFASCORE_FETCHER,
-                "status_code": test.status_code,
-                "elapsed_ms": test.elapsed_ms,
-                "gist_synced": None,
-            }
-        )
+        return JSONResponse({"ok": True, "proxy_url": url, "proxy_label": safe_proxy_label(url), "fetcher": test.fetcher, "fetcher_mode": SOFASCORE_FETCHER, "home_relay_url": safe_endpoint_label(HOME_RELAY_URL), "status_code": test.status_code, "elapsed_ms": test.elapsed_ms, "gist_synced": None})
     except Exception as e:
         logger.warning("Proxy status check falhou: %s", e)
-        return JSONResponse(
-            {
-                "ok": False,
-                "proxy_url": url,
-                "proxy_label": safe_proxy_label(url),
-                "fetcher_mode": SOFASCORE_FETCHER,
-                "detail": str(e),
-            }
-        )
+        return JSONResponse({"ok": False, "proxy_url": url, "proxy_label": safe_proxy_label(url), "fetcher_mode": SOFASCORE_FETCHER, "home_relay_url": safe_endpoint_label(HOME_RELAY_URL), "detail": str(e)})
 
 
 @app.post("/proxy-update")
@@ -519,46 +445,14 @@ def proxy_update(body: ProxyUpdateRequest, authorization: str = Header(default=N
     logger.info("PROXY_URL atualizado para: %s", safe_proxy_label(body.proxy_url))
     gist_ok = gist_write(body.proxy_url)
     if not body.proxy_url:
-        return JSONResponse(
-            {
-                "ok": False,
-                "proxy_url": "",
-                "fetcher_mode": SOFASCORE_FETCHER,
-                "gist_synced": gist_ok,
-                "detail": "Proxy removido.",
-            }
-        )
+        return JSONResponse({"ok": False, "proxy_url": "", "fetcher_mode": SOFASCORE_FETCHER, "home_relay_url": safe_endpoint_label(HOME_RELAY_URL), "gist_synced": gist_ok, "detail": "Proxy removido."})
     try:
-        test = fetch_with_requests(
-            SOFASCORE_TEST_URL,
-            proxies={"http": body.proxy_url, "https": body.proxy_url},
-            timeout=STATUS_TIMEOUT,
-        )
+        test = fetch_with_requests(SOFASCORE_TEST_URL, proxies={"http": body.proxy_url, "https": body.proxy_url}, timeout=STATUS_TIMEOUT)
         test.raise_for_status()
-        return JSONResponse(
-            {
-                "ok": True,
-                "proxy_url": body.proxy_url,
-                "proxy_label": safe_proxy_label(body.proxy_url),
-                "fetcher": test.fetcher,
-                "fetcher_mode": SOFASCORE_FETCHER,
-                "status_code": test.status_code,
-                "elapsed_ms": test.elapsed_ms,
-                "gist_synced": gist_ok,
-            }
-        )
+        return JSONResponse({"ok": True, "proxy_url": body.proxy_url, "proxy_label": safe_proxy_label(body.proxy_url), "fetcher": test.fetcher, "fetcher_mode": SOFASCORE_FETCHER, "home_relay_url": safe_endpoint_label(HOME_RELAY_URL), "status_code": test.status_code, "elapsed_ms": test.elapsed_ms, "gist_synced": gist_ok})
     except Exception as e:
         logger.warning("Novo proxy falhou no teste: %s", e)
-        return JSONResponse(
-            {
-                "ok": False,
-                "proxy_url": body.proxy_url,
-                "proxy_label": safe_proxy_label(body.proxy_url),
-                "fetcher_mode": SOFASCORE_FETCHER,
-                "gist_synced": gist_ok,
-                "detail": str(e),
-            }
-        )
+        return JSONResponse({"ok": False, "proxy_url": body.proxy_url, "proxy_label": safe_proxy_label(body.proxy_url), "fetcher_mode": SOFASCORE_FETCHER, "home_relay_url": safe_endpoint_label(HOME_RELAY_URL), "gist_synced": gist_ok, "detail": str(e)})
 
 
 @app.get("/debug/fetchers")
@@ -566,50 +460,37 @@ def debug_fetchers(authorization: str = Header(default=None)):
     verify_token(authorization)
     url = proxy_state["url"]
     proxies = {"http": url, "https": url} if url else None
-
     checks: dict[str, Any] = {}
 
     def run_check(name: str, fn: Callable[[], NormalizedResponse]) -> None:
         try:
             res = fn()
-            checks[name] = {
-                "ok": res.status_code < 400,
-                "status_code": res.status_code,
-                "elapsed_ms": res.elapsed_ms,
-                "fetcher": res.fetcher,
-                "proxy": "none" if name.endswith("direct") else proxy_label_from_mapping(proxies),
-                "text_preview": (res.text or "")[:160],
-            }
+            if res.fetcher == "home_relay":
+                route = safe_endpoint_label(HOME_RELAY_URL)
+            elif name.endswith("proxy"):
+                route = proxy_label_from_mapping(proxies)
+            else:
+                route = "direct"
+            checks[name] = {"ok": res.status_code < 400, "status_code": res.status_code, "elapsed_ms": res.elapsed_ms, "fetcher": res.fetcher, "route": route, "text_preview": (res.text or "")[:160]}
         except Exception as e:
             checks[name] = {"ok": False, "error": str(e)}
 
     run_check("requests_direct", lambda: fetch_with_requests(SOFASCORE_TEST_URL, proxies=None, timeout=STATUS_TIMEOUT))
     run_check("scrapling_direct", lambda: fetch_with_scrapling(SOFASCORE_TEST_URL, proxies=None, timeout=STATUS_TIMEOUT))
+    if HOME_RELAY_URL and HOME_RELAY_TOKEN:
+        run_check("home_relay", lambda: fetch_with_home_relay(SOFASCORE_TEST_URL, timeout=STATUS_TIMEOUT))
     if proxies:
         run_check("requests_proxy", lambda: fetch_with_requests(SOFASCORE_TEST_URL, proxies=proxies, timeout=STATUS_TIMEOUT))
         run_check("scrapling_proxy", lambda: fetch_with_scrapling(SOFASCORE_TEST_URL, proxies=proxies, timeout=STATUS_TIMEOUT))
 
     any_ok = any(item.get("ok") for item in checks.values() if isinstance(item, dict))
-    return JSONResponse(
-        {
-            "summary": {
-                "any_ok": any_ok,
-                "fetcher_mode": SOFASCORE_FETCHER,
-                "proxy_configured": bool(url),
-                "proxy_label": safe_proxy_label(url),
-                "test_url": SOFASCORE_TEST_URL,
-            },
-            "checks": checks,
-        }
-    )
+    return JSONResponse({"summary": {"any_ok": any_ok, "fetcher_mode": SOFASCORE_FETCHER, "proxy_configured": bool(url), "proxy_label": safe_proxy_label(url), "home_relay_configured": bool(HOME_RELAY_URL and HOME_RELAY_TOKEN), "home_relay_url": safe_endpoint_label(HOME_RELAY_URL), "test_url": SOFASCORE_TEST_URL}, "checks": checks})
 
 
-# --- Lógica do Proxy ---
 @app.get("/{path:path}")
 def proxy_request(path: str, request: Request):
     query_params = str(request.url.query)
     sofascore_url = build_sofascore_url(path, query_params)
-
     url = proxy_state["url"]
     proxies = {"http": url, "https": url} if url else None
 
@@ -617,13 +498,7 @@ def proxy_request(path: str, request: Request):
         response = fetch_with_retry(sofascore_url, proxies)
         response.raise_for_status()
         payload = response.json()
-        logger.info(
-            "proxy success fetcher=%s status=%s elapsed_ms=%s path=%s",
-            response.fetcher,
-            response.status_code,
-            response.elapsed_ms,
-            path,
-        )
+        logger.info("proxy success fetcher=%s status=%s elapsed_ms=%s path=%s", response.fetcher, response.status_code, response.elapsed_ms, path)
         return JSONResponse(content=payload)
     except HTTPException as e:
         logger.error("Erro HTTP upstream para %s: %s", sofascore_url, e.detail)
