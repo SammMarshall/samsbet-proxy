@@ -42,6 +42,16 @@ SOFASCORE_BASE_URL = os.environ.get("SOFASCORE_BASE_URL", "https://www.sofascore
 SOFASCORE_TEST_PATH = "sport/football/scheduled-events/today"
 SOFASCORE_TEST_URL = f"{SOFASCORE_BASE_URL}/{SOFASCORE_TEST_PATH}"
 
+# A Betano não passa pelo home_relay: o túnel só reescreve path do SofaScore.
+BETANO_ORIGIN = os.environ.get("BETANO_ORIGIN", "https://www.betano.bet.br").rstrip("/")
+BETANO_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Referer": f"{BETANO_ORIGIN}/",
+    "Origin": BETANO_ORIGIN,
+}
+
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_GIST_ID = os.environ.get("GITHUB_GIST_ID", "")
 GIST_FILENAME = "proxy_config.json"
@@ -485,6 +495,187 @@ def debug_fetchers(authorization: str = Header(default=None)):
 
     any_ok = any(item.get("ok") for item in checks.values() if isinstance(item, dict))
     return JSONResponse({"summary": {"any_ok": any_ok, "fetcher_mode": SOFASCORE_FETCHER, "proxy_configured": bool(url), "proxy_label": safe_proxy_label(url), "home_relay_configured": bool(HOME_RELAY_URL and HOME_RELAY_TOKEN), "home_relay_url": safe_endpoint_label(HOME_RELAY_URL), "test_url": SOFASCORE_TEST_URL}, "checks": checks})
+
+
+def build_betano_url(path: str, query_params: str = "") -> str:
+    clean_path = path.lstrip("/")
+    url = f"{BETANO_ORIGIN}/{clean_path}"
+    if query_params:
+        url += f"?{query_params}"
+    return url
+
+
+def fetch_betano_with_curl_cffi(
+    betano_url: str,
+    timeout: float = REQUEST_TIMEOUT,
+    headers: Optional[dict] = None,
+) -> NormalizedResponse:
+    from curl_cffi import requests as cf_requests
+
+    started = time.perf_counter()
+    response = cf_requests.get(
+        betano_url,
+        headers=headers or BETANO_HEADERS,
+        impersonate="chrome",
+        timeout=timeout,
+    )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return NormalizedResponse(
+        response.status_code,
+        response.text,
+        response.json,
+        "curl_cffi",
+        elapsed_ms,
+    )
+
+
+def fetch_betano_with_scrapling(
+    betano_url: str,
+    timeout: float = REQUEST_TIMEOUT,
+    headers: Optional[dict] = None,
+) -> NormalizedResponse:
+    try:
+        from scrapling.fetchers import Fetcher
+    except Exception as e:
+        raise RuntimeError(
+            f"Erro ao importar Scrapling Fetcher: {type(e).__name__}: {e}."
+        ) from e
+
+    started = time.perf_counter()
+    page = Fetcher.get(
+        betano_url,
+        headers=headers or BETANO_HEADERS,
+        timeout=timeout,
+        retries=1,
+        stealthy_headers=SCRAPLING_STEALTHY_HEADERS,
+        impersonate=SCRAPLING_IMPERSONATE,
+        http3=SCRAPLING_HTTP3,
+        verify=True,
+    )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    status_code = getattr(page, "status", None) or getattr(page, "status_code", None) or 0
+    text = _response_text_from_scrapling(page)
+    json_func = getattr(page, "json", None)
+    return NormalizedResponse(
+        int(status_code),
+        text,
+        json_func if callable(json_func) else lambda: _json_from_text(text),
+        "scrapling",
+        elapsed_ms,
+    )
+
+
+def fetch_betano_with_requests(
+    betano_url: str,
+    proxies: Optional[dict],
+    timeout: float = REQUEST_TIMEOUT,
+    headers: Optional[dict] = None,
+) -> NormalizedResponse:
+    started = time.perf_counter()
+    response = requests.get(
+        betano_url,
+        headers=headers or BETANO_HEADERS,
+        proxies=proxies,
+        verify=False,
+        timeout=timeout,
+    )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return NormalizedResponse(response.status_code, response.text, response.json, "requests", elapsed_ms)
+
+
+def choose_betano_fetcher(
+    betano_url: str,
+    proxies: Optional[dict],
+    extra_headers: Optional[dict] = None,
+) -> NormalizedResponse:
+    """
+    Busca a Betano a partir deste host (Render), sem o home_relay do SofaScore.
+
+    Ordem: Scrapling → curl_cffi → requests via PROXY_URL residencial do Gist, se houver.
+    """
+    headers = dict(BETANO_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+
+    last_error: Optional[NormalizedResponse] = None
+    try:
+        scrapling_response = fetch_betano_with_scrapling(betano_url, headers=headers)
+        logger.info(
+            "betano scrapling status=%s elapsed_ms=%s url=%s",
+            scrapling_response.status_code,
+            scrapling_response.elapsed_ms,
+            betano_url,
+        )
+        if scrapling_response.status_code < 400:
+            return scrapling_response
+        last_error = scrapling_response
+    except Exception as e:
+        logger.warning("betano scrapling exception: %s", e)
+
+    try:
+        cffi_response = fetch_betano_with_curl_cffi(betano_url, headers=headers)
+        logger.info(
+            "betano curl_cffi status=%s elapsed_ms=%s url=%s",
+            cffi_response.status_code,
+            cffi_response.elapsed_ms,
+            betano_url,
+        )
+        if cffi_response.status_code < 400:
+            return cffi_response
+        last_error = cffi_response
+    except Exception as e:
+        logger.warning("betano curl_cffi exception: %s", e)
+
+    if proxies:
+        proxy_response = fetch_betano_with_requests(
+            betano_url,
+            proxies=proxies,
+            headers=headers,
+        )
+        logger.info(
+            "betano requests/proxy status=%s elapsed_ms=%s route=%s url=%s",
+            proxy_response.status_code,
+            proxy_response.elapsed_ms,
+            proxy_label_from_mapping(proxies),
+            betano_url,
+        )
+        return proxy_response
+
+    if last_error is not None:
+        return last_error
+    raise RuntimeError("Nenhuma resposta Betano foi obtida.")
+
+
+@app.get("/betano/{path:path}")
+def betano_proxy(path: str, request: Request):
+    """Espelho da Betano. Ex.: /betano/api/sport/futebol/ligas/ → betano.bet.br/..."""
+    query_params = str(request.url.query)
+    betano_url = build_betano_url(path, query_params)
+    url = proxy_state["url"]
+    proxies = {"http": url, "https": url} if url else None
+    extra_headers: dict[str, str] = {}
+    cookie = request.headers.get("cookie")
+    if cookie:
+        extra_headers["Cookie"] = cookie
+
+    try:
+        response = choose_betano_fetcher(betano_url, proxies, extra_headers=extra_headers)
+        response.raise_for_status()
+        payload = response.json()
+        logger.info(
+            "betano success fetcher=%s status=%s elapsed_ms=%s path=%s",
+            response.fetcher,
+            response.status_code,
+            response.elapsed_ms,
+            path,
+        )
+        return JSONResponse(content=payload)
+    except HTTPException as e:
+        logger.error("Erro HTTP Betano para %s: %s", betano_url, e.detail)
+        return JSONResponse(content={"error": e.detail}, status_code=e.status_code)
+    except Exception as e:
+        logger.exception("Erro no proxy Betano para %s", betano_url)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @app.get("/{path:path}")
