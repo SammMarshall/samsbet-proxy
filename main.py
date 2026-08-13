@@ -567,7 +567,6 @@ def fetch_betano_with_scrapling(
 
 def fetch_betano_with_requests(
     betano_url: str,
-    proxies: Optional[dict],
     timeout: float = REQUEST_TIMEOUT,
     headers: Optional[dict] = None,
 ) -> NormalizedResponse:
@@ -575,7 +574,6 @@ def fetch_betano_with_requests(
     response = requests.get(
         betano_url,
         headers=headers or BETANO_HEADERS,
-        proxies=proxies,
         verify=False,
         timeout=timeout,
     )
@@ -585,13 +583,13 @@ def fetch_betano_with_requests(
 
 def choose_betano_fetcher(
     betano_url: str,
-    proxies: Optional[dict],
     extra_headers: Optional[dict] = None,
 ) -> NormalizedResponse:
     """
-    Busca a Betano a partir deste host (Render), sem o home_relay do SofaScore.
+    Busca a Betano direto deste host (Render).
 
-    Ordem: Scrapling → curl_cffi → requests via PROXY_URL residencial do Gist, se houver.
+    Não usa home_relay nem o PROXY_URL do Gist — esses são só do SofaScore/SamsBet.
+    Ordem: Scrapling → curl_cffi → requests direto.
     """
     headers = dict(BETANO_HEADERS)
     if extra_headers:
@@ -626,20 +624,19 @@ def choose_betano_fetcher(
     except Exception as e:
         logger.warning("betano curl_cffi exception: %s", e)
 
-    if proxies:
-        proxy_response = fetch_betano_with_requests(
-            betano_url,
-            proxies=proxies,
-            headers=headers,
-        )
+    try:
+        direct = fetch_betano_with_requests(betano_url, headers=headers)
         logger.info(
-            "betano requests/proxy status=%s elapsed_ms=%s route=%s url=%s",
-            proxy_response.status_code,
-            proxy_response.elapsed_ms,
-            proxy_label_from_mapping(proxies),
+            "betano requests status=%s elapsed_ms=%s url=%s",
+            direct.status_code,
+            direct.elapsed_ms,
             betano_url,
         )
-        return proxy_response
+        if direct.status_code < 400:
+            return direct
+        last_error = direct
+    except Exception as e:
+        logger.warning("betano requests exception: %s", e)
 
     if last_error is not None:
         return last_error
@@ -651,15 +648,13 @@ def betano_proxy(path: str, request: Request):
     """Espelho da Betano. Ex.: /betano/api/sport/futebol/ligas/ → betano.bet.br/..."""
     query_params = str(request.url.query)
     betano_url = build_betano_url(path, query_params)
-    url = proxy_state["url"]
-    proxies = {"http": url, "https": url} if url else None
     extra_headers: dict[str, str] = {}
     cookie = request.headers.get("cookie")
     if cookie:
         extra_headers["Cookie"] = cookie
 
     try:
-        response = choose_betano_fetcher(betano_url, proxies, extra_headers=extra_headers)
+        response = choose_betano_fetcher(betano_url, extra_headers=extra_headers)
         response.raise_for_status()
         payload = response.json()
         logger.info(
