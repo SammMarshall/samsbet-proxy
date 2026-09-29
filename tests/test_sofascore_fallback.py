@@ -71,6 +71,23 @@ class SofaScoreFallbackTests(unittest.TestCase):
             "https://www.sofascore.com/api/v1/example", proxies=proxies
         )
 
+    def test_residential_proxy_uses_existing_certificate_policy(self):
+        proxies = {"https": "http://proxy.example:1234"}
+        with patch("curl_cffi.requests.get") as request:
+            request.return_value.status_code = 200
+            request.return_value.text = "{}"
+            main.fetch_sofascore_with_curl_cffi(
+                "https://www.sofascore.com/api/v1/example", proxies=proxies
+            )
+
+        request.assert_called_once_with(
+            "https://www.sofascore.com/api/v1/example",
+            impersonate="chrome",
+            timeout=main.REQUEST_TIMEOUT,
+            proxies=proxies,
+            verify=False,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

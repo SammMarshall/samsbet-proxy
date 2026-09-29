@@ -268,6 +268,7 @@ def fetch_sofascore_with_curl_cffi(
         impersonate="chrome",
         timeout=timeout,
         proxies=proxies,
+        verify=not bool(proxies),
     )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     return NormalizedResponse(
