@@ -65,7 +65,7 @@ HOME_RELAY_URL = os.environ.get("HOME_RELAY_URL", "").rstrip("/")
 HOME_RELAY_TOKEN = os.environ.get("HOME_RELAY_TOKEN", "")
 
 SOFASCORE_FETCHER = os.environ.get("SOFASCORE_FETCHER", "requests").strip().lower()
-VALID_FETCHERS = {"requests", "scrapling", "home_relay", "auto"}
+VALID_FETCHERS = {"requests", "scrapling", "curl_cffi", "home_relay", "auto"}
 if SOFASCORE_FETCHER not in VALID_FETCHERS:
     logger.warning("SOFASCORE_FETCHER inválido '%s'; usando 'requests'", SOFASCORE_FETCHER)
     SOFASCORE_FETCHER = "requests"
@@ -255,6 +255,27 @@ def fetch_with_home_relay(sofascore_url: str, timeout: float = REQUEST_TIMEOUT) 
     return NormalizedResponse(response.status_code, response.text, response.json, "home_relay", elapsed_ms)
 
 
+def fetch_sofascore_with_curl_cffi(
+    sofascore_url: str, timeout: float = REQUEST_TIMEOUT
+) -> NormalizedResponse:
+    from curl_cffi import requests as cf_requests
+
+    started = time.perf_counter()
+    response = cf_requests.get(
+        sofascore_url,
+        impersonate="chrome",
+        timeout=timeout,
+    )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return NormalizedResponse(
+        response.status_code,
+        response.text,
+        response.json,
+        "curl_cffi",
+        elapsed_ms,
+    )
+
+
 def fetch_with_scrapling(
     sofascore_url: str,
     proxies: Optional[dict] = None,
@@ -269,10 +290,9 @@ def fetch_with_scrapling(
         ) from e
 
     kwargs: dict[str, Any] = {
-        "headers": HEADERS,
         "timeout": timeout,
         "retries": 1,
-        "stealthy_headers": SCRAPLING_STEALTHY_HEADERS,
+        "stealthy_headers": False,
         "impersonate": SCRAPLING_IMPERSONATE,
         "http3": SCRAPLING_HTTP3,
         "verify": True,
@@ -303,9 +323,35 @@ def is_bad_endpoint(response: NormalizedResponse) -> bool:
     )
 
 
+def is_sofascore_forbidden(response: NormalizedResponse) -> bool:
+    if response.status_code != 403:
+        return False
+    try:
+        error = response.json().get("error", {})
+        return error.get("code") == 403 and error.get("reason") == "Forbidden"
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedResponse:
     if SOFASCORE_FETCHER == "home_relay":
-        return fetch_with_home_relay(sofascore_url)
+        relay_response = fetch_with_home_relay(sofascore_url)
+        if is_sofascore_forbidden(relay_response):
+            logger.warning("SofaScore retornou 403 ao relay; tentando curl_cffi direto")
+            try:
+                browser_response = fetch_sofascore_with_curl_cffi(sofascore_url)
+                if browser_response.status_code < 400:
+                    return browser_response
+                logger.warning(
+                    "curl_cffi direto também falhou status=%s",
+                    browser_response.status_code,
+                )
+            except Exception as exc:
+                logger.warning("curl_cffi direto falhou: %s", exc)
+        return relay_response
+
+    if SOFASCORE_FETCHER == "curl_cffi":
+        return fetch_sofascore_with_curl_cffi(sofascore_url)
 
     if SOFASCORE_FETCHER == "scrapling":
         return fetch_with_scrapling(sofascore_url, proxies=None)

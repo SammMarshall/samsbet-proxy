@@ -7,4 +7,5 @@ scrapling
 curl_cffi
 browserforge
 playwright
+patchright
 python-dotenv
