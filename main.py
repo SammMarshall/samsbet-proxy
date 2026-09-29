@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -63,6 +64,9 @@ STATUS_TIMEOUT = float(os.environ.get("STATUS_TIMEOUT", "10.0"))
 
 HOME_RELAY_URL = os.environ.get("HOME_RELAY_URL", "").rstrip("/")
 HOME_RELAY_TOKEN = os.environ.get("HOME_RELAY_TOKEN", "")
+HOME_RELAY_403_COOLDOWN_SECONDS = max(
+    0.0, float(os.environ.get("HOME_RELAY_403_COOLDOWN_SECONDS", "300"))
+)
 
 SOFASCORE_FETCHER = os.environ.get("SOFASCORE_FETCHER", "requests").strip().lower()
 VALID_FETCHERS = {"requests", "scrapling", "curl_cffi", "home_relay", "auto"}
@@ -337,28 +341,86 @@ def is_sofascore_forbidden(response: NormalizedResponse) -> bool:
         return False
 
 
+class Relay403Cooldown:
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self.open_until = 0.0
+        self.probing = False
+        self.lock = threading.Lock()
+        self.clock = time.monotonic
+
+    def before_request(self) -> tuple[bool, bool]:
+        with self.lock:
+            if self.open_until == 0:
+                return True, False
+            if self.clock() < self.open_until or self.probing:
+                return False, False
+            self.probing = True
+            return True, True
+
+    def after_response(self, response: NormalizedResponse, is_probe: bool) -> None:
+        with self.lock:
+            if is_sofascore_forbidden(response):
+                self.open_until = self.clock() + self.seconds
+                logger.warning("Relay SofaScore retornou 403; usando proxy por %ss", self.seconds)
+            elif is_probe:
+                self.open_until = 0.0
+                logger.info("Relay SofaScore respondeu sem 403; encerrando cooldown")
+            if is_probe:
+                self.probing = False
+
+    def after_error(self, is_probe: bool) -> None:
+        if is_probe:
+            with self.lock:
+                self.open_until = 0.0
+                self.probing = False
+
+
+relay_403_cooldown = Relay403Cooldown(HOME_RELAY_403_COOLDOWN_SECONDS)
+
+
+def fetch_sofascore_fallback(
+    sofascore_url: str, proxies: Optional[dict]
+) -> Optional[NormalizedResponse]:
+    last_response = None
+    for route_proxies in (proxies, None) if proxies else (None,):
+        route = proxy_label_from_mapping(route_proxies) if route_proxies else "direct"
+        logger.warning("Tentando SofaScore com curl_cffi route=%s", route)
+        try:
+            browser_response = fetch_sofascore_with_curl_cffi(
+                sofascore_url, proxies=route_proxies
+            )
+            last_response = browser_response
+            if browser_response.status_code < 400:
+                return browser_response
+            logger.warning(
+                "curl_cffi falhou status=%s route=%s",
+                browser_response.status_code,
+                route,
+            )
+        except Exception as exc:
+            logger.warning("curl_cffi falhou error=%s route=%s", type(exc).__name__, route)
+    return last_response
+
+
 def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedResponse:
     if SOFASCORE_FETCHER == "home_relay":
-        relay_response = fetch_with_home_relay(sofascore_url)
+        use_relay, is_probe = relay_403_cooldown.before_request()
+        if not use_relay:
+            fallback_response = fetch_sofascore_fallback(sofascore_url, proxies)
+            if fallback_response is None:
+                raise RuntimeError("SofaScore fallback indisponível durante o cooldown do relay")
+            return fallback_response
+        try:
+            relay_response = fetch_with_home_relay(sofascore_url)
+        except Exception:
+            relay_403_cooldown.after_error(is_probe)
+            raise
+        relay_403_cooldown.after_response(relay_response, is_probe)
         if is_sofascore_forbidden(relay_response):
-            for route_proxies in (proxies, None) if proxies else (None,):
-                route = proxy_label_from_mapping(route_proxies) if route_proxies else "direct"
-                logger.warning("SofaScore retornou 403 ao relay; tentando curl_cffi route=%s", route)
-                try:
-                    browser_response = fetch_sofascore_with_curl_cffi(
-                        sofascore_url, proxies=route_proxies
-                    )
-                    if browser_response.status_code < 400:
-                        return browser_response
-                    logger.warning(
-                        "curl_cffi falhou status=%s route=%s",
-                        browser_response.status_code,
-                        route,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "curl_cffi falhou error=%s route=%s", type(exc).__name__, route
-                    )
+            fallback_response = fetch_sofascore_fallback(sofascore_url, proxies)
+            if fallback_response is not None and fallback_response.status_code < 400:
+                return fallback_response
         return relay_response
 
     if SOFASCORE_FETCHER == "curl_cffi":

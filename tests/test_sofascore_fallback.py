@@ -5,6 +5,14 @@ import main
 
 
 class SofaScoreFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        cooldown = main.Relay403Cooldown(300)
+        cooldown.clock = lambda: self.now
+        patcher = patch.object(main, "relay_403_cooldown", cooldown)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_upstream_forbidden_uses_browser_compatible_fetcher(self):
         relay = main.NormalizedResponse(
             403,
@@ -87,6 +95,65 @@ class SofaScoreFallbackTests(unittest.TestCase):
             proxies=proxies,
             verify=False,
         )
+
+    def test_forbidden_skips_relay_for_five_minutes_and_renews_on_next_403(self):
+        forbidden = main.NormalizedResponse(
+            403,
+            '{"error": {"code": 403, "reason": "Forbidden"}}',
+            lambda: {"error": {"code": 403, "reason": "Forbidden"}},
+            "home_relay",
+            1,
+        )
+        relay_ok = main.NormalizedResponse(
+            200, '{"scheduled": []}', lambda: {"scheduled": []}, "home_relay", 1
+        )
+        proxy_ok = main.NormalizedResponse(
+            200, '{"scheduled": []}', lambda: {"scheduled": []}, "curl_cffi_proxy", 1
+        )
+        url = "https://www.sofascore.com/api/v1/example"
+        proxies = {"https": "http://proxy.example:1234"}
+
+        with (
+            patch.object(main, "SOFASCORE_FETCHER", "home_relay"),
+            patch.object(main, "fetch_with_home_relay", side_effect=[forbidden, forbidden, relay_ok, relay_ok]) as relay,
+            patch.object(main, "fetch_sofascore_with_curl_cffi", return_value=proxy_ok) as fallback,
+        ):
+            self.assertIs(main.choose_fetcher(url, proxies), proxy_ok)
+            self.now = 299
+            self.assertIs(main.choose_fetcher(url, proxies), proxy_ok)
+            self.assertEqual(relay.call_count, 1)
+
+            self.now = 300
+            self.assertIs(main.choose_fetcher(url, proxies), proxy_ok)
+            self.now = 599
+            self.assertIs(main.choose_fetcher(url, proxies), proxy_ok)
+            self.assertEqual(relay.call_count, 2)
+
+            self.now = 600
+            self.assertIs(main.choose_fetcher(url, proxies), relay_ok)
+            self.now = 601
+            self.assertIs(main.choose_fetcher(url, proxies), relay_ok)
+
+        self.assertEqual(relay.call_count, 4)
+        self.assertEqual(fallback.call_count, 4)
+
+    def test_only_one_request_probes_relay_after_cooldown(self):
+        cooldown = main.relay_403_cooldown
+        forbidden = main.NormalizedResponse(
+            403,
+            '{"error": {"code": 403, "reason": "Forbidden"}}',
+            lambda: {"error": {"code": 403, "reason": "Forbidden"}},
+            "home_relay",
+            1,
+        )
+        cooldown.after_response(forbidden, is_probe=False)
+        self.now = 300
+
+        self.assertEqual(cooldown.before_request(), (True, True))
+        self.assertEqual(cooldown.before_request(), (False, False))
+
+        cooldown.after_response(forbidden, is_probe=True)
+        self.assertEqual(cooldown.before_request(), (False, False))
 
 
 if __name__ == "__main__":
