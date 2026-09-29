@@ -385,7 +385,7 @@ def fetch_sofascore_fallback(
     last_response = None
     for route_proxies in (proxies, None) if proxies else (None,):
         route = proxy_label_from_mapping(route_proxies) if route_proxies else "direct"
-        logger.warning("Tentando SofaScore com curl_cffi route=%s", route)
+        logger.info("Tentando SofaScore com curl_cffi route=%s url=%s", route, sofascore_url)
         try:
             browser_response = fetch_sofascore_with_curl_cffi(
                 sofascore_url, proxies=route_proxies
@@ -394,16 +394,21 @@ def fetch_sofascore_fallback(
             if browser_response.status_code < 400:
                 return browser_response
             logger.warning(
-                "curl_cffi falhou status=%s route=%s",
+                "curl_cffi falhou status=%s route=%s url=%s",
                 browser_response.status_code,
                 route,
+                sofascore_url,
             )
         except Exception as exc:
-            logger.warning("curl_cffi falhou error=%s route=%s", type(exc).__name__, route)
+            logger.warning(
+                "curl_cffi falhou error=%s route=%s url=%s",
+                type(exc).__name__, route, sofascore_url,
+            )
     return last_response
 
 
 def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedResponse:
+    logger.info("Consultando SofaScore fetcher_mode=%s url=%s", SOFASCORE_FETCHER, sofascore_url)
     if SOFASCORE_FETCHER == "home_relay":
         use_relay, is_probe = relay_403_cooldown.before_request()
         if not use_relay:
@@ -412,6 +417,7 @@ def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedRes
                 raise RuntimeError("SofaScore fallback indisponível durante o cooldown do relay")
             return fallback_response
         try:
+            logger.info("Tentando SofaScore via home_relay url=%s", sofascore_url)
             relay_response = fetch_with_home_relay(sofascore_url)
         except Exception:
             relay_403_cooldown.after_error(is_probe)

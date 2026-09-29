@@ -79,6 +79,29 @@ class SofaScoreFallbackTests(unittest.TestCase):
             "https://www.sofascore.com/api/v1/example", proxies=proxies
         )
 
+    def test_logs_sofascore_url_for_relay_and_proxy_attempts(self):
+        url = "https://www.sofascore.com/api/v1/example?page=2"
+        relay = main.NormalizedResponse(
+            403,
+            '{"error": {"code": 403, "reason": "Forbidden"}}',
+            lambda: {"error": {"code": 403, "reason": "Forbidden"}},
+            "home_relay",
+            1,
+        )
+        proxy = main.NormalizedResponse(200, "{}", lambda: {}, "curl_cffi_proxy", 1)
+        proxies = {"https": "http://proxy.example:1234"}
+
+        with (
+            patch.object(main, "SOFASCORE_FETCHER", "home_relay"),
+            patch.object(main, "fetch_with_home_relay", return_value=relay),
+            patch.object(main, "fetch_sofascore_with_curl_cffi", return_value=proxy),
+            self.assertLogs(main.logger, level="INFO") as logs,
+        ):
+            main.choose_fetcher(url, proxies)
+
+        self.assertTrue(any(f"via home_relay url={url}" in line for line in logs.output))
+        self.assertTrue(any(f"route=http://proxy.example:1234 url={url}" in line for line in logs.output))
+
     def test_residential_proxy_uses_existing_certificate_policy(self):
         proxies = {"https": "http://proxy.example:1234"}
         with patch("curl_cffi.requests.get") as request:
