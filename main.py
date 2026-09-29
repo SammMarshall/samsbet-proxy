@@ -687,8 +687,8 @@ def proxy_request(path: str, request: Request):
         logger.info("proxy success fetcher=%s status=%s elapsed_ms=%s path=%s", response.fetcher, response.status_code, response.elapsed_ms, path)
         return JSONResponse(content=payload)
     except HTTPException as e:
-        logger.error("Erro HTTP upstream para %s: %s", sofascore_url, e.detail)
-        return JSONResponse(content={"error": e.detail}, status_code=500)
+        logger.error("Erro HTTP upstream para %r: %s", sofascore_url, e.detail)
+        return JSONResponse(content={"error": e.detail}, status_code=e.status_code)
     except Exception as e:
         logger.exception("Erro no proxy para %s", sofascore_url)
         return JSONResponse(content={"error": str(e)}, status_code=500)
