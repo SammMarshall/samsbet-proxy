@@ -46,6 +46,31 @@ class SofaScoreFallbackTests(unittest.TestCase):
         self.assertIs(result, relay)
         fallback.assert_not_called()
 
+    def test_upstream_forbidden_tries_residential_proxy_first(self):
+        relay = main.NormalizedResponse(
+            403,
+            '{"error": {"code": 403, "reason": "Forbidden"}}',
+            lambda: {"error": {"code": 403, "reason": "Forbidden"}},
+            "home_relay",
+            1,
+        )
+        residential = main.NormalizedResponse(
+            200, '{"scheduled": []}', lambda: {"scheduled": []}, "curl_cffi_proxy", 1
+        )
+        proxies = {"http": "http://proxy.example:1234", "https": "http://proxy.example:1234"}
+
+        with (
+            patch.object(main, "SOFASCORE_FETCHER", "home_relay"),
+            patch.object(main, "fetch_with_home_relay", return_value=relay),
+            patch.object(main, "fetch_sofascore_with_curl_cffi", return_value=residential) as fallback,
+        ):
+            result = main.choose_fetcher("https://www.sofascore.com/api/v1/example", proxies)
+
+        self.assertIs(result, residential)
+        fallback.assert_called_once_with(
+            "https://www.sofascore.com/api/v1/example", proxies=proxies
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

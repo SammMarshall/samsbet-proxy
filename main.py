@@ -256,7 +256,9 @@ def fetch_with_home_relay(sofascore_url: str, timeout: float = REQUEST_TIMEOUT) 
 
 
 def fetch_sofascore_with_curl_cffi(
-    sofascore_url: str, timeout: float = REQUEST_TIMEOUT
+    sofascore_url: str,
+    timeout: float = REQUEST_TIMEOUT,
+    proxies: Optional[dict] = None,
 ) -> NormalizedResponse:
     from curl_cffi import requests as cf_requests
 
@@ -265,13 +267,14 @@ def fetch_sofascore_with_curl_cffi(
         sofascore_url,
         impersonate="chrome",
         timeout=timeout,
+        proxies=proxies,
     )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     return NormalizedResponse(
         response.status_code,
         response.text,
         response.json,
-        "curl_cffi",
+        "curl_cffi_proxy" if proxies else "curl_cffi",
         elapsed_ms,
     )
 
@@ -337,17 +340,24 @@ def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedRes
     if SOFASCORE_FETCHER == "home_relay":
         relay_response = fetch_with_home_relay(sofascore_url)
         if is_sofascore_forbidden(relay_response):
-            logger.warning("SofaScore retornou 403 ao relay; tentando curl_cffi direto")
-            try:
-                browser_response = fetch_sofascore_with_curl_cffi(sofascore_url)
-                if browser_response.status_code < 400:
-                    return browser_response
-                logger.warning(
-                    "curl_cffi direto também falhou status=%s",
-                    browser_response.status_code,
-                )
-            except Exception as exc:
-                logger.warning("curl_cffi direto falhou: %s", exc)
+            for route_proxies in (proxies, None) if proxies else (None,):
+                route = proxy_label_from_mapping(route_proxies) if route_proxies else "direct"
+                logger.warning("SofaScore retornou 403 ao relay; tentando curl_cffi route=%s", route)
+                try:
+                    browser_response = fetch_sofascore_with_curl_cffi(
+                        sofascore_url, proxies=route_proxies
+                    )
+                    if browser_response.status_code < 400:
+                        return browser_response
+                    logger.warning(
+                        "curl_cffi falhou status=%s route=%s",
+                        browser_response.status_code,
+                        route,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "curl_cffi falhou error=%s route=%s", type(exc).__name__, route
+                    )
         return relay_response
 
     if SOFASCORE_FETCHER == "curl_cffi":
@@ -395,6 +405,8 @@ def fetch_with_retry(sofascore_url: str, proxies: Optional[dict]) -> NormalizedR
             route = proxy_label_from_mapping(proxies)
         elif response.fetcher == "home_relay":
             route = safe_endpoint_label(HOME_RELAY_URL)
+        elif response.fetcher == "curl_cffi_proxy":
+            route = proxy_label_from_mapping(proxies)
         else:
             route = "direct"
 
