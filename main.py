@@ -391,6 +391,25 @@ def fetch_sofascore_fallback(
                 sofascore_url, proxies=route_proxies
             )
             last_response = browser_response
+            if route_proxies and browser_response.status_code == 402:
+                body = (browser_response.text or "").lower()
+                markers = [
+                    name for name, needle in (
+                        ("bad_endpoint", "bad_endpoint"),
+                        ("residential_failed", "residential failed"),
+                        ("no_peers", "no peers"),
+                        ("payment", "payment"),
+                        ("balance", "balance"),
+                        ("quota", "quota"),
+                        ("rate_limit", "rate limit"),
+                        ("blocked", "blocked"),
+                        ("challenge", "challenge"),
+                    ) if needle in body
+                ]
+                logger.warning(
+                    "[DEBUG-402] proxy response markers=%s body_length=%s url=%s",
+                    ",".join(markers) or "none", len(body), sofascore_url,
+                )
             if browser_response.status_code < 400:
                 return browser_response
             logger.warning(
