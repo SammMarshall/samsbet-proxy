@@ -54,7 +54,7 @@ class SofaScoreFallbackTests(unittest.TestCase):
         self.assertIs(result, relay)
         fallback.assert_not_called()
 
-    def test_upstream_forbidden_tries_residential_proxy_first(self):
+    def test_upstream_forbidden_tries_direct_before_residential_proxy(self):
         relay = main.NormalizedResponse(
             403,
             '{"error": {"code": 403, "reason": "Forbidden"}}',
@@ -65,19 +65,33 @@ class SofaScoreFallbackTests(unittest.TestCase):
         residential = main.NormalizedResponse(
             200, '{"scheduled": []}', lambda: {"scheduled": []}, "curl_cffi_proxy", 1
         )
+        direct_challenge = main.NormalizedResponse(
+            403, '{"error": {"reason": "challenge"}}',
+            lambda: {"error": {"reason": "challenge"}}, "curl_cffi", 1
+        )
         proxies = {"http": "http://proxy.example:1234", "https": "http://proxy.example:1234"}
 
         with (
             patch.object(main, "SOFASCORE_FETCHER", "home_relay"),
             patch.object(main, "fetch_with_home_relay", return_value=relay),
-            patch.object(main, "fetch_sofascore_with_curl_cffi", return_value=residential) as fallback,
+            patch.object(main, "fetch_sofascore_with_curl_cffi", side_effect=[direct_challenge, residential]) as fallback,
         ):
             result = main.choose_fetcher("https://www.sofascore.com/api/v1/example", proxies)
 
         self.assertIs(result, residential)
-        fallback.assert_called_once_with(
-            "https://www.sofascore.com/api/v1/example", proxies=proxies
+        self.assertEqual(
+            [call.kwargs["proxies"] for call in fallback.call_args_list],
+            [None, proxies],
         )
+
+    def test_direct_success_does_not_use_residential_proxy(self):
+        direct = main.NormalizedResponse(200, "{}", lambda: {}, "curl_cffi", 1)
+        proxies = {"https": "http://proxy.example:1234"}
+        with patch.object(main, "fetch_sofascore_with_curl_cffi", return_value=direct) as fetch:
+            result = main.fetch_sofascore_fallback("https://www.sofascore.com/api/v1/example", proxies)
+
+        self.assertIs(result, direct)
+        fetch.assert_called_once_with("https://www.sofascore.com/api/v1/example", proxies=None)
 
     def test_logs_sofascore_url_for_relay_and_proxy_attempts(self):
         url = "https://www.sofascore.com/api/v1/example?page=2"
@@ -89,12 +103,13 @@ class SofaScoreFallbackTests(unittest.TestCase):
             1,
         )
         proxy = main.NormalizedResponse(200, "{}", lambda: {}, "curl_cffi_proxy", 1)
+        direct_challenge = main.NormalizedResponse(403, "challenge", lambda: {}, "curl_cffi", 1)
         proxies = {"https": "http://proxy.example:1234"}
 
         with (
             patch.object(main, "SOFASCORE_FETCHER", "home_relay"),
             patch.object(main, "fetch_with_home_relay", return_value=relay),
-            patch.object(main, "fetch_sofascore_with_curl_cffi", return_value=proxy),
+            patch.object(main, "fetch_sofascore_with_curl_cffi", side_effect=[direct_challenge, proxy]),
             self.assertLogs(main.logger, level="INFO") as logs,
         ):
             main.choose_fetcher(url, proxies)
@@ -133,13 +148,14 @@ class SofaScoreFallbackTests(unittest.TestCase):
         proxy_ok = main.NormalizedResponse(
             200, '{"scheduled": []}', lambda: {"scheduled": []}, "curl_cffi_proxy", 1
         )
+        direct_challenge = main.NormalizedResponse(403, "challenge", lambda: {}, "curl_cffi", 1)
         url = "https://www.sofascore.com/api/v1/example"
         proxies = {"https": "http://proxy.example:1234"}
 
         with (
             patch.object(main, "SOFASCORE_FETCHER", "home_relay"),
             patch.object(main, "fetch_with_home_relay", side_effect=[forbidden, forbidden, relay_ok, relay_ok]) as relay,
-            patch.object(main, "fetch_sofascore_with_curl_cffi", return_value=proxy_ok) as fallback,
+            patch.object(main, "fetch_sofascore_with_curl_cffi", side_effect=lambda _url, proxies=None: proxy_ok if proxies else direct_challenge) as fallback,
         ):
             self.assertIs(main.choose_fetcher(url, proxies), proxy_ok)
             self.now = 299
@@ -158,7 +174,7 @@ class SofaScoreFallbackTests(unittest.TestCase):
             self.assertIs(main.choose_fetcher(url, proxies), relay_ok)
 
         self.assertEqual(relay.call_count, 4)
-        self.assertEqual(fallback.call_count, 4)
+        self.assertEqual(fallback.call_count, 8)
 
     def test_only_one_request_probes_relay_after_cooldown(self):
         cooldown = main.relay_403_cooldown
@@ -178,7 +194,7 @@ class SofaScoreFallbackTests(unittest.TestCase):
         cooldown.after_response(forbidden, is_probe=True)
         self.assertEqual(cooldown.before_request(), (False, False))
 
-    def test_residential_bad_endpoint_is_retried_before_direct_challenge(self):
+    def test_residential_bad_endpoint_is_retried_after_direct_challenge(self):
         url = "https://www.sofascore.com/api/v1/unique-tournament/390/season/89840/standings/total"
         proxies = {"https": "http://proxy.example:1234"}
         bad_endpoint = main.NormalizedResponse(
@@ -188,10 +204,11 @@ class SofaScoreFallbackTests(unittest.TestCase):
             200, '{"standings": []}', lambda: {"standings": []}, "curl_cffi_proxy", 1
         )
         proxy_responses = iter([bad_endpoint, proxy_ok])
+        direct_challenge = main.NormalizedResponse(403, "challenge", lambda: {}, "curl_cffi", 1)
 
         def fetch_browser(_url, proxies=None):
             if proxies is None:
-                self.fail("A tentativa direta não deve encobrir bad_endpoint")
+                return direct_challenge
             return next(proxy_responses)
         self.now = 1
         main.relay_403_cooldown.open_until = 300
@@ -211,6 +228,59 @@ class SofaScoreFallbackTests(unittest.TestCase):
 
         self.assertIs(response, proxy_ok)
         relay.assert_not_called()
+        self.assertEqual(browser.call_count, 4)
+
+    def test_residential_kyc_block_is_not_retried(self):
+        url = "https://www.sofascore.com/api/v1/unique-tournament/325/season/87678/standings/total"
+        proxies = {"https": "http://proxy.example:1234"}
+        direct_challenge = main.NormalizedResponse(403, "challenge", lambda: {}, "curl_cffi", 1)
+        kyc_block = main.NormalizedResponse(
+            402,
+            "Residential Failed (bad_endpoint): Requested site is not available for immediate residential (no KYC) access mode in accordance with robots.txt.",
+            lambda: {}, "curl_cffi_proxy", 1,
+        )
+        self.now = 1
+        main.relay_403_cooldown.open_until = 300
+
+        with (
+            patch.object(main, "SOFASCORE_FETCHER", "home_relay"),
+            patch.object(main, "MAX_RETRIES", 8),
+            patch.object(main, "RETRY_SLEEP", 0),
+            patch.object(main, "fetch_sofascore_with_curl_cffi", side_effect=lambda _url, proxies=None: kyc_block if proxies else direct_challenge) as browser,
+        ):
+            response = main.fetch_with_retry(url, proxies)
+
+        self.assertIs(response, kyc_block)
+        self.assertFalse(main.is_bad_endpoint(response))
+        self.assertEqual(browser.call_count, 2)
+
+    def test_relay_forbidden_preserves_residential_kyc_block(self):
+        url = "https://www.sofascore.com/api/v1/unique-tournament/325/season/87678/standings/total"
+        proxies = {"https": "http://proxy.example:1234"}
+        relay_forbidden = main.NormalizedResponse(
+            403,
+            '{"error": {"code": 403, "reason": "Forbidden"}}',
+            lambda: {"error": {"code": 403, "reason": "Forbidden"}},
+            "home_relay", 1,
+        )
+        direct_challenge = main.NormalizedResponse(403, "challenge", lambda: {}, "curl_cffi", 1)
+        kyc_block = main.NormalizedResponse(
+            402,
+            "Residential Failed (bad_endpoint): immediate residential (no KYC) access mode",
+            lambda: {}, "curl_cffi_proxy", 1,
+        )
+
+        with (
+            patch.object(main, "SOFASCORE_FETCHER", "home_relay"),
+            patch.object(main, "MAX_RETRIES", 8),
+            patch.object(main, "RETRY_SLEEP", 0),
+            patch.object(main, "fetch_with_home_relay", return_value=relay_forbidden) as relay,
+            patch.object(main, "fetch_sofascore_with_curl_cffi", side_effect=lambda _url, proxies=None: kyc_block if proxies else direct_challenge) as browser,
+        ):
+            response = main.fetch_with_retry(url, proxies)
+
+        self.assertIs(response, kyc_block)
+        relay.assert_called_once()
         self.assertEqual(browser.call_count, 2)
 
 

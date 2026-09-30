@@ -325,9 +325,19 @@ def fetch_with_scrapling(
 
 
 def is_bad_endpoint(response: NormalizedResponse) -> bool:
+    if is_residential_kyc_block(response):
+        return False
     response_text = (response.text or "").lower()
     return response.status_code in (402, 500) and (
         "bad_endpoint" in response_text or "residential failed" in response_text
+    )
+
+
+def is_residential_kyc_block(response: NormalizedResponse) -> bool:
+    response_text = (response.text or "").lower()
+    return response.status_code == 402 and (
+        "immediate residential" in response_text
+        and "kyc" in response_text
     )
 
 
@@ -383,7 +393,7 @@ def fetch_sofascore_fallback(
     sofascore_url: str, proxies: Optional[dict]
 ) -> Optional[NormalizedResponse]:
     last_response = None
-    for route_proxies in (proxies, None) if proxies else (None,):
+    for route_proxies in (None, proxies) if proxies else (None,):
         route = proxy_label_from_mapping(route_proxies) if route_proxies else "direct"
         logger.info("Tentando SofaScore com curl_cffi route=%s url=%s", route, sofascore_url)
         try:
@@ -392,6 +402,12 @@ def fetch_sofascore_fallback(
             )
             last_response = browser_response
             if browser_response.status_code < 400:
+                return browser_response
+            if route_proxies and is_residential_kyc_block(browser_response):
+                logger.warning(
+                    "Bright Data exige KYC para esta rota; sem novas tentativas url=%s",
+                    sofascore_url,
+                )
                 return browser_response
             if route_proxies and is_bad_endpoint(browser_response):
                 return browser_response
@@ -427,9 +443,7 @@ def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedRes
         relay_403_cooldown.after_response(relay_response, is_probe)
         if is_sofascore_forbidden(relay_response):
             fallback_response = fetch_sofascore_fallback(sofascore_url, proxies)
-            if fallback_response is not None and (
-                fallback_response.status_code < 400 or is_bad_endpoint(fallback_response)
-            ):
+            if fallback_response is not None:
                 return fallback_response
         return relay_response
 
