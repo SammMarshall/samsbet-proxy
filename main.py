@@ -391,26 +391,9 @@ def fetch_sofascore_fallback(
                 sofascore_url, proxies=route_proxies
             )
             last_response = browser_response
-            if route_proxies and browser_response.status_code == 402:
-                body = (browser_response.text or "").lower()
-                markers = [
-                    name for name, needle in (
-                        ("bad_endpoint", "bad_endpoint"),
-                        ("residential_failed", "residential failed"),
-                        ("no_peers", "no peers"),
-                        ("payment", "payment"),
-                        ("balance", "balance"),
-                        ("quota", "quota"),
-                        ("rate_limit", "rate limit"),
-                        ("blocked", "blocked"),
-                        ("challenge", "challenge"),
-                    ) if needle in body
-                ]
-                logger.warning(
-                    "[DEBUG-402] proxy response markers=%s body_length=%s url=%s",
-                    ",".join(markers) or "none", len(body), sofascore_url,
-                )
             if browser_response.status_code < 400:
+                return browser_response
+            if route_proxies and is_bad_endpoint(browser_response):
                 return browser_response
             logger.warning(
                 "curl_cffi falhou status=%s route=%s url=%s",
@@ -444,7 +427,9 @@ def choose_fetcher(sofascore_url: str, proxies: Optional[dict]) -> NormalizedRes
         relay_403_cooldown.after_response(relay_response, is_probe)
         if is_sofascore_forbidden(relay_response):
             fallback_response = fetch_sofascore_fallback(sofascore_url, proxies)
-            if fallback_response is not None and fallback_response.status_code < 400:
+            if fallback_response is not None and (
+                fallback_response.status_code < 400 or is_bad_endpoint(fallback_response)
+            ):
                 return fallback_response
         return relay_response
 

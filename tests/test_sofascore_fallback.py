@@ -178,6 +178,41 @@ class SofaScoreFallbackTests(unittest.TestCase):
         cooldown.after_response(forbidden, is_probe=True)
         self.assertEqual(cooldown.before_request(), (False, False))
 
+    def test_residential_bad_endpoint_is_retried_before_direct_challenge(self):
+        url = "https://www.sofascore.com/api/v1/unique-tournament/390/season/89840/standings/total"
+        proxies = {"https": "http://proxy.example:1234"}
+        bad_endpoint = main.NormalizedResponse(
+            402, "bad_endpoint: residential failed", lambda: {}, "curl_cffi_proxy", 1
+        )
+        proxy_ok = main.NormalizedResponse(
+            200, '{"standings": []}', lambda: {"standings": []}, "curl_cffi_proxy", 1
+        )
+        proxy_responses = iter([bad_endpoint, proxy_ok])
+
+        def fetch_browser(_url, proxies=None):
+            if proxies is None:
+                self.fail("A tentativa direta não deve encobrir bad_endpoint")
+            return next(proxy_responses)
+        self.now = 1
+        main.relay_403_cooldown.open_until = 300
+
+        with (
+            patch.object(main, "SOFASCORE_FETCHER", "home_relay"),
+            patch.object(main, "MAX_RETRIES", 2),
+            patch.object(main, "RETRY_SLEEP", 0),
+            patch.object(main, "fetch_with_home_relay") as relay,
+            patch.object(
+                main,
+                "fetch_sofascore_with_curl_cffi",
+                side_effect=fetch_browser,
+            ) as browser,
+        ):
+            response = main.fetch_with_retry(url, proxies)
+
+        self.assertIs(response, proxy_ok)
+        relay.assert_not_called()
+        self.assertEqual(browser.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
